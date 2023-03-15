@@ -6,6 +6,7 @@ package winio
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"runtime"
 	"sync"
@@ -188,10 +189,88 @@ func newThreadToken() (windows.Token, error) {
 	return token, nil
 }
 
+func openCurrentThreadToken() (windows.Token, error) {
+	var token windows.Token
+	err := openThreadToken(getCurrentThread(), syscall.TOKEN_ALL_ACCESS, true, &token)
+	if err != nil {
+		return 0, err
+	}
+	return token, nil
+}
+
 func releaseThreadToken(h windows.Token) {
 	err := revertToSelf()
 	if err != nil {
 		panic(err)
 	}
 	h.Close()
+}
+
+func getPrivilegesForToken(token windows.Token) ([]string, error) {
+	n := uint32(0)
+	if err := windows.GetTokenInformation(token, windows.TokenPrivileges, nil, 0, &n); err != nil {
+		if !errors.Is(err, windows.ERROR_INSUFFICIENT_BUFFER) {
+			return nil, err
+		}
+	}
+
+	b := make([]byte, n)
+	if err := windows.GetTokenInformation(token, windows.TokenPrivileges, &b[0], uint32(len(b)), &n); err != nil {
+		return nil, err
+	}
+
+	privBuff := bytes.NewBuffer(b)
+
+	var nPrivs uint32
+	if err := binary.Read(privBuff, binary.LittleEndian, &nPrivs); err != nil {
+		return nil, fmt.Errorf("cannot read number of privileges: %w", err)
+	}
+
+	enabledPrivileges := []string{}
+	for i := 0; i < int(nPrivs); i++ {
+		var (
+			luid       uint64
+			attributes uint32
+		)
+
+		if err := binary.Read(privBuff, binary.LittleEndian, &luid); err != nil {
+			return nil, fmt.Errorf("cannot read LUID from buffer: %w", err)
+		}
+
+		if err := binary.Read(privBuff, binary.LittleEndian, &attributes); err != nil {
+			return nil, fmt.Errorf("cannot read attributes from buffer: %w", err)
+		}
+
+		var nameBuffer [256]uint16
+		bufSize := uint32(len(nameBuffer))
+		err := lookupPrivilegeName("", &luid, &nameBuffer[0], &bufSize)
+		if err != nil {
+			return nil, fmt.Errorf("<unknown privilege %d>", luid)
+		}
+
+		name := string(utf16.Decode(nameBuffer[:bufSize]))
+		if attributes&windows.SE_PRIVILEGE_ENABLED > 0 {
+			enabledPrivileges = append(enabledPrivileges, name)
+		}
+	}
+
+	return enabledPrivileges, nil
+}
+
+func GetEnabledPrivileges() ([]string, error) {
+	var token windows.Token
+	han := windows.CurrentProcess()
+	if err := windows.OpenProcessToken(han, windows.TOKEN_ALL_ACCESS, &token); err != nil {
+		return nil, err
+	}
+	defer token.Close()
+	return getPrivilegesForToken(token)
+}
+
+func GetCurrentThreadPrivileges() ([]string, error) {
+	token, err := openCurrentThreadToken()
+	if err != nil {
+		return nil, err
+	}
+	return getPrivilegesForToken(token)
 }
